@@ -1041,6 +1041,43 @@ describe('browser tab targeting commands', () => {
     return JSON.parse(last);
   }
 
+  it.each([
+    { args: ['list'], want: { groupOp: 'list' } },
+    { args: ['create', 'Hiring', '--window-id', '2'], want: { groupOp: 'create', groupName: 'Hiring', groupWindowId: 2 } },
+    { args: ['use', '91'], want: { groupOp: 'use', groupId: 91 } },
+    { args: ['use', 'Hiring'], want: { groupOp: 'use', groupName: 'Hiring' } },
+    { args: ['rename', '91', 'Recruiting'], want: { groupOp: 'rename', groupId: 91, groupName: 'Recruiting' } },
+    { args: ['delete', '91'], want: { groupOp: 'delete', groupId: 91 } },
+  ])('routes group $args through the chosen profile and session', async ({ args, want }) => {
+    mockSendCommand.mockResolvedValueOnce({ id: 91, title: 'Hiring' });
+    const program = createProgram('', '').exitOverride();
+    await program.parseAsync(['node', 'opencli', '--profile', 'explicit-profile', 'browser', '--session', 'hiring', 'group', ...args]);
+    expect(mockSendCommand).toHaveBeenCalledWith('groups', expect.objectContaining({ session: 'hiring', surface: 'browser', contextId: 'explicit-profile', ...want }));
+    expect(lastJsonLog()).toEqual({ id: 91, title: 'Hiring' });
+  });
+
+  it('reports invalid group IDs without sending a browser mutation', async () => {
+    const program = createProgram('', '').exitOverride();
+    await program.parseAsync(['node', 'opencli', 'browser', '--session', 'hiring', 'group', 'delete', 'invalid']);
+    expect(mockSendCommand).not.toHaveBeenCalled();
+    expect(lastJsonLog()).toMatchObject({ error: { code: 'tab_group_id_invalid' } });
+  });
+
+  it('clears a previously saved default tab when selecting a different group', async () => {
+    const scopePath = getBrowserStateFile(String(process.env.OPENCLI_CACHE_DIR));
+    fs.mkdirSync(path.dirname(scopePath), { recursive: true });
+    fs.writeFileSync(scopePath, JSON.stringify({ defaultPage: 'tab-1' }));
+    const program = createProgram('', '').exitOverride();
+    await program.parseAsync(['node', 'opencli', 'browser', '--session', 'test', 'group', 'use', 'Hiring']);
+    expect(fs.existsSync(scopePath)).toBe(false);
+  });
+
+  it('honors the browser background-window policy for group selection', async () => {
+    const program = createProgram('', '').exitOverride();
+    await program.parseAsync(['node', 'opencli', 'browser', '--session', 'hiring', '--window', 'background', 'group', 'use', 'Hiring']);
+    expect(mockSendCommand).toHaveBeenCalledWith('groups', expect.objectContaining({ windowMode: 'background', groupName: 'Hiring' }));
+  });
+
   it('binds the current Chrome tab into a browser session', async () => {
     const program = createProgram('', '');
 

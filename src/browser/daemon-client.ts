@@ -4,6 +4,7 @@
  * Provides a typed send() function that posts a Command and returns a Result.
  */
 
+import type { GroupCommandFields } from './group-contract.js';
 import { sleep } from '../utils.js';
 import { BrowserConnectError, SessionBusyError } from '../errors.js';
 import { COMMAND_RESULT_UNKNOWN_CODE, COMMAND_RESULT_UNKNOWN_HINT } from '../daemon-utils.js';
@@ -204,9 +205,9 @@ function isPreConnectFetchError(err: unknown): boolean {
   return false;
 }
 
-export interface DaemonCommand {
+export interface DaemonCommand extends GroupCommandFields {
   id: string;
-  action: 'exec' | 'navigate' | 'tabs' | 'cookies' | 'screenshot' | 'close-window' | 'set-file-input' | 'insert-text' | 'bind' | 'network-capture-start' | 'network-capture-read' | 'wait-download' | 'cdp' | 'frames' | 'lease-release';
+  action: 'exec' | 'navigate' | 'tabs' | 'groups' | 'cookies' | 'screenshot' | 'close-window' | 'set-file-input' | 'insert-text' | 'bind' | 'network-capture-start' | 'network-capture-read' | 'wait-download' | 'cdp' | 'frames' | 'lease-release';
   /** Target page identity (targetId). Cross-layer contract with the extension. */
   page?: string;
   code?: string;

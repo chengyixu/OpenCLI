@@ -766,6 +766,75 @@ async function executeWithJournal(cmd, execute) {
   }
 }
 
+class TabGroupError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+    this.name = "TabGroupError";
+  }
+}
+function groupName(value) {
+  const name = value?.trim();
+  if (!name) throw new TabGroupError("tab_group_name_required", "Provide a non-empty group name.");
+  return name;
+}
+async function getGroup(id) {
+  if (!Number.isSafeInteger(id) || id < 0) {
+    throw new TabGroupError("tab_group_id_invalid", "Group IDs must be non-negative integers from group list.");
+  }
+  try {
+    return await chrome.tabGroups.get(id);
+  } catch (err) {
+    if (err instanceof Error && /No group with id|group no longer exists/i.test(err.message)) {
+      throw new TabGroupError("tab_group_not_found", `Group ${id} no longer exists. Run group list and select a live group.`);
+    }
+    throw err;
+  }
+}
+async function findGroup(id, name) {
+  if (id !== void 0) return getGroup(id);
+  const title = groupName(name);
+  const matches = (await chrome.tabGroups.query({})).filter((group) => group.title === title);
+  if (matches.length > 1) {
+    throw new TabGroupError("tab_group_ambiguous", `Several groups are named "${title}". Select one by ID from group list.`);
+  }
+  if (!matches.length) throw new TabGroupError("tab_group_not_found", `No live group is named "${title}".`);
+  return matches[0];
+}
+async function describeGroup(group) {
+  const tabs = await chrome.tabs.query({ groupId: group.id });
+  return {
+    id: group.id,
+    title: group.title ?? "",
+    color: group.color,
+    collapsed: group.collapsed,
+    windowId: group.windowId,
+    tabs: await Promise.all(tabs.map(async (tab) => ({
+      page: tab.id === void 0 ? void 0 : await resolveTargetId(tab.id).catch(() => void 0),
+      title: tab.title ?? "",
+      url: tab.url ?? "",
+      active: tab.active ?? false
+    })))
+  };
+}
+async function createGroup(name, windowId) {
+  const title = groupName(name);
+  if (windowId !== void 0 && (!Number.isSafeInteger(windowId) || windowId < 0)) {
+    throw new TabGroupError("tab_group_window_invalid", "Window IDs must be non-negative integers.");
+  }
+  const tab = await chrome.tabs.create({ url: "about:blank", active: true, ...windowId !== void 0 && { windowId } });
+  if (tab.id === void 0) throw new TabGroupError("tab_group_create_failed", "Chrome did not return a new tab ID.");
+  try {
+    const id = await chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId: tab.windowId } });
+    await chrome.tabGroups.update(id, { title, collapsed: false });
+    return await getGroup(id);
+  } catch (err) {
+    await chrome.tabs.remove(tab.id).catch(() => {
+    });
+    throw err;
+  }
+}
+
 let ws = null;
 let reconnectTimer = null;
 let reconnectAttempts = 0;
@@ -1023,7 +1092,7 @@ function getSessionFromKey(key) {
 }
 function getIdleTimeout(key) {
   const session = automationSessions.get(key);
-  if (session?.kind === "bound") return IDLE_TIMEOUT_NONE;
+  if (session?.kind === "bound" || session?.kind === "group") return IDLE_TIMEOUT_NONE;
   const overrides = sessionOverrides.get(key);
   const adapterPersistent = getSurfaceFromKey(key) === "adapter" && (session?.lifecycle === "persistent" || overrides?.lifecycle === "persistent");
   if (adapterPersistent) return IDLE_TIMEOUT_NONE;
@@ -1031,7 +1100,7 @@ function getIdleTimeout(key) {
   return getSurfaceFromKey(key) === "browser" ? IDLE_TIMEOUT_INTERACTIVE : IDLE_TIMEOUT_DEFAULT;
 }
 function getLeaseLifecycle(key, kind) {
-  if (kind === "bound") return "pinned";
+  if (kind === "bound" || kind === "group") return "pinned";
   const override = sessionOverrides.get(key)?.lifecycle;
   if (override) return override;
   return getSurfaceFromKey(key) === "browser" ? "persistent" : "ephemeral";
@@ -1127,6 +1196,7 @@ async function persistRuntimeState() {
       windowId: session.windowId,
       owned: session.owned,
       preferredTabId: session.preferredTabId,
+      ...session.groupId !== void 0 && { groupId: session.groupId },
       contextId: session.contextId,
       ownership: session.ownership,
       lifecycle: session.lifecycle,
@@ -1598,6 +1668,10 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   evictTab(tabId);
   for (const [leaseKey, session] of automationSessions.entries()) {
     if (session.preferredTabId === tabId) {
+      if (session.kind === "group") {
+        session.preferredTabId = null;
+        continue;
+      }
       if (session.idleTimer) clearTimeout(session.idleTimer);
       automationSessions.delete(leaseKey);
       sessionOverrides.delete(leaseKey);
@@ -1709,6 +1783,8 @@ async function handleCommand(cmd) {
         return await handleNavigate(cmd, leaseKey);
       case "tabs":
         return await handleTabs(cmd, leaseKey);
+      case "groups":
+        return await withLeaseMutation(() => handleGroups(cmd, leaseKey));
       case "cookies":
         return await handleCookies(cmd);
       case "screenshot":
@@ -1816,6 +1892,7 @@ async function resolveCommandTabId(cmd) {
 }
 async function resolveTab(tabId, leaseKey, initialUrl) {
   const existingSession = automationSessions.get(leaseKey);
+  if (existingSession?.kind === "group") return resolveGroupTab(tabId, existingSession);
   if (tabId !== void 0) {
     try {
       const tab = await chrome.tabs.get(tabId);
@@ -1919,6 +1996,11 @@ async function resolveTabId(tabId, leaseKey, initialUrl) {
 async function listAutomationTabs(leaseKey) {
   const session = automationSessions.get(leaseKey);
   if (!session) return [];
+  if (session?.kind === "group") {
+    const group = await getGroup(session.groupId);
+    session.windowId = group.windowId;
+    return chrome.tabs.query({ groupId: group.id });
+  }
   if (session.preferredTabId !== null) {
     try {
       return [await chrome.tabs.get(session.preferredTabId)];
@@ -1957,8 +2039,14 @@ function classifyExtensionError(message) {
 }
 function errorResult(id, err) {
   const message = err instanceof Error ? err.message : String(err);
-  if (err instanceof CommandFailure) {
-    return { id, ok: false, error: message, errorCode: err.code, ...err.hint ? { errorHint: err.hint } : {} };
+  if (err instanceof CommandFailure || err instanceof TabGroupError) {
+    return {
+      id,
+      ok: false,
+      error: message,
+      errorCode: err.code,
+      ...err instanceof CommandFailure && err.hint ? { errorHint: err.hint } : {}
+    };
   }
   const errorCode = classifyExtensionError(message);
   return { id, ok: false, error: message, ...errorCode ? { errorCode } : {} };
@@ -2064,7 +2152,7 @@ async function handleNavigate(cmd, leaseKey) {
   });
   let tab = await chrome.tabs.get(tabId);
   const postNavigationSession = automationSessions.get(leaseKey);
-  if (postNavigationSession && tab.windowId !== postNavigationSession.windowId) {
+  if (postNavigationSession && postNavigationSession.kind !== "group" && tab.windowId !== postNavigationSession.windowId) {
     console.warn(`[opencli] Tab ${tabId} drifted to window ${tab.windowId} during navigation, moving back to ${postNavigationSession.windowId}`);
     try {
       await chrome.tabs.move(tabId, { windowId: postNavigationSession.windowId, index: -1 });
@@ -2077,6 +2165,7 @@ async function handleNavigate(cmd, leaseKey) {
 }
 async function handleTabs(cmd, leaseKey) {
   const session = automationSessions.get(leaseKey);
+  if (session?.kind === "group") return handleGroupTabs(cmd, leaseKey, session);
   if (session && !session.owned && cmd.op !== "list") {
     return {
       id: cmd.id,
@@ -2209,6 +2298,148 @@ async function handleTabs(cmd, leaseKey) {
     default:
       return { id: cmd.id, ok: false, error: `Unknown tabs op: ${cmd.op}` };
   }
+}
+async function resolveGroupTab(tabId, session) {
+  const group = await getGroup(session.groupId);
+  session.windowId = group.windowId;
+  const tabs = await chrome.tabs.query({ groupId: group.id });
+  const target = tabId !== void 0 ? tabs.find((tab) => tab.id === tabId) : tabs.find((tab) => tab.id === session.preferredTabId && isDebuggableUrl(tab.url)) ?? tabs.find((tab) => isDebuggableUrl(tab.url));
+  if (!target || target.id === void 0) {
+    throw new TabGroupError(
+      tabId !== void 0 ? "group_tab_mismatch" : "group_tab_not_found",
+      tabId !== void 0 ? "The target tab is outside the selected group." : "No debuggable tab in this group. Use tab new to add one."
+    );
+  }
+  if ([...automationSessions.values()].some((other) => other !== session && other.preferredTabId === target.id)) {
+    throw new TabGroupError("group_tab_busy", "Another session controls this tab. Select another member or use tab new.");
+  }
+  if (!isDebuggableUrl(target.url)) throw new TabGroupError("group_tab_not_debuggable", "This tab cannot be inspected.");
+  if (tabId === void 0) session.preferredTabId = target.id;
+  return { tabId: target.id, tab: target };
+}
+async function bindGroup(leaseKey, group) {
+  const tabs = await chrome.tabs.query({ groupId: group.id });
+  for (const [otherKey, other] of automationSessions) {
+    if (otherKey !== leaseKey && other.owned && tabs.some((tab) => tab.id === other.preferredTabId)) {
+      throw new TabGroupError("tab_group_busy", "This group contains a tab owned by another OpenCLI session. Release that session first.");
+    }
+  }
+  const previous = automationSessions.get(leaseKey);
+  if (previous && tabs.some((tab) => tab.id === previous.preferredTabId)) {
+    if (previous.preferredTabId !== null) await safeDetach(previous.preferredTabId);
+  } else {
+    await releaseLease(leaseKey, "group use");
+  }
+  interactiveGroupLedger.delete(group.id);
+  if (ownedContainers.interactive.groupId === group.id) {
+    ownedContainers.interactive.groupId = null;
+    ownedContainers.interactive.windowId = null;
+  }
+  const available = tabs.filter((tab) => ![...automationSessions.entries()].some(([key, other]) => key !== leaseKey && other.preferredTabId === tab.id));
+  const target = available.find((tab) => tab.id === previous?.preferredTabId && isDebuggableUrl(tab.url)) ?? available.find((tab) => isDebuggableUrl(tab.url));
+  setLeaseSession(leaseKey, {
+    session: getSessionFromKey(leaseKey),
+    surface: "browser",
+    kind: "group",
+    owned: false,
+    groupId: group.id,
+    windowId: group.windowId,
+    preferredTabId: target?.id ?? null
+  });
+  resetWindowIdleTimer(leaseKey);
+  await focusOwnedWindowIfRequested(group.windowId, getWindowMode(leaseKey));
+  await persistRuntimeState();
+  return target?.id === void 0 ? void 0 : resolveTargetId(target.id);
+}
+async function handleGroups(cmd, leaseKey) {
+  await workerReady;
+  if (getSurfaceFromKey(leaseKey) !== "browser") throw new TabGroupError("tab_groups_unsupported", "Use group commands with a browser session.");
+  if (cmd.groupOp === "list") {
+    const groups = await chrome.tabGroups.query({});
+    return { id: cmd.id, ok: true, data: await Promise.all(groups.map(describeGroup)) };
+  }
+  if (cmd.groupOp === "create" || cmd.groupOp === "use") {
+    const group = cmd.groupOp === "create" ? await createGroup(cmd.groupName, cmd.groupWindowId) : await findGroup(cmd.groupId, cmd.groupName);
+    const page = await bindGroup(leaseKey, group);
+    return { id: cmd.id, ok: true, data: await describeGroup(group), ...page && { page } };
+  }
+  if (cmd.groupOp === "rename" || cmd.groupOp === "delete") {
+    const group = await findGroup(cmd.groupId, cmd.groupOp === "delete" ? cmd.groupName : void 0);
+    if (cmd.groupOp === "rename") {
+      const title = groupName(cmd.groupName);
+      if (interactiveGroupLedger.has(group.id)) await bindGroup(leaseKey, group);
+      await chrome.tabGroups.update(group.id, { title });
+      return { id: cmd.id, ok: true, data: await describeGroup(await getGroup(group.id)) };
+    }
+    const tabs = await chrome.tabs.query({ groupId: group.id });
+    const ids = tabs.flatMap((tab) => tab.id === void 0 ? [] : [tab.id]);
+    if (ids.length) await chrome.tabs.ungroup(ids);
+    for (const [key, session] of automationSessions) {
+      if (session.kind === "group" && session.groupId === group.id || ids.includes(session.preferredTabId ?? -1)) {
+        if (session.preferredTabId !== null) await safeDetach(session.preferredTabId);
+        await removeLeaseSession(key);
+      }
+    }
+    interactiveGroupLedger.delete(group.id);
+    if (ownedContainers.interactive.groupId === group.id) {
+      ownedContainers.interactive.groupId = null;
+      ownedContainers.interactive.windowId = null;
+    }
+    await persistRuntimeState();
+    return { id: cmd.id, ok: true, data: { deleted: group.id, tabsUngrouped: ids.length } };
+  }
+  throw new TabGroupError("tab_group_operation_invalid", "Choose group list, create, use, rename, or delete.");
+}
+async function handleGroupTabs(cmd, leaseKey, session) {
+  const group = await getGroup(session.groupId);
+  session.windowId = group.windowId;
+  if (cmd.op === "list") {
+    const tabs = await listAutomationWebTabs(leaseKey);
+    const data = await Promise.all(tabs.map(async (tab, index) => ({
+      index,
+      page: await resolveTargetId(tab.id),
+      url: tab.url,
+      title: tab.title,
+      active: tab.active
+    })));
+    return { id: cmd.id, ok: true, data };
+  }
+  if (cmd.op === "new") {
+    if (cmd.url && !isSafeNavigationUrl(cmd.url)) throw new TabGroupError("group_tab_url_invalid", "Only http(s) URLs are permitted.");
+    const tab = await chrome.tabs.create({ windowId: group.windowId, url: cmd.url ?? BLANK_PAGE, active: true });
+    if (tab.id === void 0) throw new TabGroupError("group_tab_create_failed", "Chrome did not return a tab ID.");
+    try {
+      await chrome.tabs.group({ groupId: group.id, tabIds: [tab.id] });
+    } catch (err) {
+      await chrome.tabs.remove(tab.id).catch(() => {
+      });
+      throw err;
+    }
+    session.preferredTabId = tab.id;
+    await persistRuntimeState();
+    return pageScopedResult(cmd.id, tab.id, { url: tab.url });
+  }
+  if (cmd.op === "select" || cmd.op === "close") {
+    const tabs = await listAutomationWebTabs(leaseKey);
+    const tabId = cmd.page ? await resolveCommandTabId(cmd) : cmd.index !== void 0 ? tabs[cmd.index]?.id : session.preferredTabId ?? void 0;
+    if (tabId === void 0) throw new TabGroupError("group_tab_not_found", "Select a tab from tab list.");
+    const resolved = await resolveGroupTab(tabId, session);
+    if (cmd.op === "select") {
+      await chrome.tabs.update(resolved.tabId, { active: true });
+      await focusOwnedWindowIfRequested(group.windowId, getWindowMode(leaseKey));
+      session.preferredTabId = resolved.tabId;
+      await persistRuntimeState();
+      return pageScopedResult(cmd.id, resolved.tabId, { selected: true });
+    }
+    const page = await resolveTargetId(resolved.tabId);
+    await safeDetach(resolved.tabId);
+    await chrome.tabs.remove(resolved.tabId);
+    evictTab(resolved.tabId);
+    session.preferredTabId = null;
+    await persistRuntimeState();
+    return { id: cmd.id, ok: true, data: { closed: page } };
+  }
+  throw new TabGroupError("group_tab_operation_invalid", "Choose tab list, new, select, or close.");
 }
 async function handleCookies(cmd) {
   if (!cmd.domain && !cmd.url) {
@@ -2423,6 +2654,24 @@ async function reconcileTargetLeaseRegistry() {
   }
   automationSessions.clear();
   for (const [leaseKey, stored] of Object.entries(registry.leases)) {
+    if (stored.kind === "group" && stored.groupId !== void 0) {
+      setLeaseSession(leaseKey, {
+        session: getSessionFromKey(leaseKey),
+        surface: "browser",
+        kind: "group",
+        windowId: stored.windowId,
+        groupId: stored.groupId,
+        owned: false,
+        preferredTabId: stored.preferredTabId
+      });
+      try {
+        const group = await getGroup(stored.groupId);
+        automationSessions.get(leaseKey).windowId = group.windowId;
+      } catch {
+      }
+      resetWindowIdleTimer(leaseKey);
+      continue;
+    }
     const tabId = stored.preferredTabId;
     if (tabId === null) continue;
     try {

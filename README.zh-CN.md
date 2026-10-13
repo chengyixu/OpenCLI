@@ -132,6 +132,19 @@ Agent 在内部自动处理所有 `opencli browser` 命令——你只需用自�
 
 `opencli browser` 命令必须紧跟一个 `<session>` 位置参数。`opencli browser work open <url>` 和 `opencli browser work tab new [url]` 都会返回 target ID。`opencli browser work tab list` 用来查看当前已存在 tab 的 target ID，再通过 `--tab <targetId>` 把命令明确路由到某个 tab。`tab new` 只会新建 tab，不会改变默认浏览器目标；只有显式执行 `tab select <targetId>`，才会把该 tab 设为同一 session 后续未指定 target 的默认目标。
 
+## 任务标签组
+
+让 Agent 为任务创建或使用指定的 Chrome 标签组：
+
+```bash
+opencli browser hiring group list
+opencli browser hiring group create "Hiring"
+opencli browser hiring tab new https://example.com/jobs
+opencli browser hiring close
+```
+
+`group use "Hiring"` 接管已有标签组；该会话的标签与页面操作限制在组内。释放控制后保留标签组与页面。`group rename <id> <name>` 重命名，`group delete <id>` 取消成员标签的分组，不关闭页面。重名组须用 `group list` 返回的 ID 区分。浏览器或扩展重启后重新查询并选择；详见[标签组指南](./docs/guide/browser-task-groups.md)。这些命令需要同时使用新版 CLI 与支持标签组命令的 Browser Bridge。
+
 ## 为新站点写适配器
 
 当你需要的网站还没覆盖时，用 `opencli-adapter-author` skill，全流程：

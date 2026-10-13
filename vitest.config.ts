@@ -2,6 +2,7 @@ import { defineConfig } from 'vitest/config';
 
 const includeExtendedE2e = process.env.OPENCLI_E2E === '1';
 const includeAxChromeE2e = process.env.OPENCLI_AX_E2E === '1';
+const includeGroupChromeE2e = process.env.OPENCLI_GROUP_E2E === '1';
 
 export default defineConfig({
   test: {
@@ -44,6 +45,7 @@ export default defineConfig({
             'tests/e2e/local-commands.test.ts',
             'tests/e2e/management.test.ts',
             ...(includeAxChromeE2e ? ['tests/e2e/browser-ax-chrome.test.ts'] : []),
+            ...(includeGroupChromeE2e ? ['tests/e2e/browser-groups-chrome.test.ts'] : []),
             // Live sites require an authenticated browser; keep them out of offline E2E.
             //   OPENCLI_E2E=1 npx vitest run
             ...(includeExtendedE2e ? ['tests/e2e/browser-public.test.ts', 'tests/e2e/douban.test.ts', 'tests/e2e/plugin-management.test.ts', 'tests/e2e/article-download-pipeline.test.ts'] : []),

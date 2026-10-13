@@ -1,14 +1,17 @@
 /**
  * opencli browser protocol — shared types between daemon, extension, and CLI.
  *
- * 5 actions: exec, navigate, tabs, cookies, screenshot.
- * Everything else is just JS code sent via 'exec'.
+ * Native tab, window and group operations accompany page-scoped actions.
+ * DOM operations are sent via 'exec'.
  */
+
+import type { GroupCommandFields } from '../../src/browser/group-contract';
 
 export type Action =
   | 'exec'
   | 'navigate'
   | 'tabs'
+  | 'groups'
   | 'cookies'
   | 'screenshot'
   | 'close-window'
@@ -22,7 +25,7 @@ export type Action =
   | 'cdp'
   | 'frames';
 
-export interface Command {
+export interface Command extends GroupCommandFields {
   /** Unique request ID */
   id: string;
   /** Action type */

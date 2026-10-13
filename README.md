@@ -146,6 +146,19 @@ Available browser commands include `open`, `state`, `click`, `type`, `fill`, `se
 
 `opencli browser` commands require a `<session>` positional immediately after `browser`. `opencli browser work open <url>` and `opencli browser work tab new [url]` both return a target ID. Use `opencli browser work tab list` to inspect target IDs, then pass `--tab <targetId>` to route a command to a specific tab. `tab new` creates a new tab without changing the default browser target; only `tab select <targetId>` promotes that tab to the default target for later untargeted commands in the same session.
 
+## Browser task groups
+
+Keep a task's browser pages in an agent-named Chrome group:
+
+```bash
+opencli browser hiring group list
+opencli browser hiring group create "Hiring"
+opencli browser hiring tab new https://example.com/jobs
+opencli browser hiring close
+```
+
+Use `group use "Hiring"` to borrow an existing group. The session's tab and page commands stay inside it; releasing control leaves the group and pages open. `group rename <id> <name>` changes a title, and `group delete <id>` ungroups its tabs without closing them. Use IDs from `group list` to distinguish duplicate titles. See [the group guide](./docs/guide/browser-task-groups.md) for recovery and Chrome API limits. These commands require the updated Browser Bridge as well as the CLI.
+
 ## Writing a new adapter
 
 When the site you need is not yet covered, use the `opencli-adapter-author` skill end-to-end:

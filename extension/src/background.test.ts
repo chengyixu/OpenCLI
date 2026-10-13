@@ -272,6 +272,253 @@ describe('background tab isolation', () => {
     vi.unstubAllGlobals();
   });
 
+  it('discovers live groups across windows without acquiring a tab lease', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs[1].groupId = 91;
+    groups.push({ id: 91, windowId: 2, title: 'Hiring', color: 'blue', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const result = await mod.__test__.handleCommand({ id: 'g-list', action: 'groups', groupOp: 'list', session: 'hiring' } as any);
+    expect(result).toMatchObject({ ok: true, data: [{ id: 91, title: 'Hiring', windowId: 2, tabs: [{ page: 'target-2', url: 'https://user.example' }] }] });
+    expect(mod.__test__.getSession(browserKey('hiring'))).toBeNull();
+    expect(chrome.tabs.create).not.toHaveBeenCalled();
+  });
+
+  it('keeps task groups separate and routes later tabs into the selected group', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs[1].groupId = 91;
+    groups.push({ id: 91, windowId: 2, title: 'Hiring', color: 'blue', collapsed: false });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const used = await mod.__test__.handleCommand({ id: 'g-use', action: 'groups', groupOp: 'use', groupName: 'Hiring', session: 'hiring' } as any);
+    expect(used).toMatchObject({ ok: true, page: 'target-2', data: { id: 91, title: 'Hiring' } });
+    const added = await mod.__test__.handleCommand({ id: 'g-new', action: 'tabs', op: 'new', url: 'https://jobs.example', session: 'hiring' });
+    expect(added.ok).toBe(true);
+    expect(tabs.find(tab => tab.url === 'https://jobs.example')).toMatchObject({ windowId: 2, groupId: 91 });
+    const listed = await mod.__test__.handleCommand({ id: 'g-tabs', action: 'tabs', op: 'list', session: 'hiring' });
+    expect((listed.data as any[]).map(tab => tab.url)).toEqual(['https://user.example', 'https://jobs.example']);
+    const selected = await mod.__test__.handleCommand({ id: 'g-select', action: 'tabs', op: 'select', page: 'target-2', session: 'hiring' });
+    expect(selected).toMatchObject({ ok: true, page: 'target-2' });
+    await mod.__test__.resolveTabId(undefined, browserKey('unrelated'));
+    expect(groups.find(group => group.id === 91)).toMatchObject({ title: 'Hiring', color: 'blue' });
+    expect(tabs[1]).toMatchObject({ url: 'https://user.example', groupId: 91 });
+  });
+
+  it('matches group titles literally and requires an ID for duplicates', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs[1].groupId = 91;
+    groups.push({ id: 91, windowId: 2, title: 'Hiring*' }, { id: 92, windowId: 1, title: 'Hiring Team' });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const used = await mod.__test__.handleCommand({ id: 'g-literal', action: 'groups', groupOp: 'use', groupName: 'Hiring*', session: 'hiring' } as any);
+    expect(used).toMatchObject({ ok: true, data: { id: 91 } });
+    groups.push({ id: 93, windowId: 1, title: 'Hiring*' });
+    const ambiguous = await mod.__test__.handleCommand({ id: 'g-ambiguous', action: 'groups', groupOp: 'use', groupName: 'Hiring*', session: 'other' } as any);
+    expect(ambiguous).toMatchObject({ ok: false, errorCode: 'tab_group_ambiguous' });
+    const byId = await mod.__test__.handleCommand({ id: 'g-id', action: 'groups', groupOp: 'use', groupId: 91, session: 'hiring' } as any);
+    expect(byId).toMatchObject({ ok: true, data: { id: 91 } });
+    expect(groups.map(group => group.id)).toEqual([91, 92, 93]);
+  });
+
+  it('creates a named group and preserves its tabs when releasing control', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const created = await mod.__test__.handleCommand({ id: 'g-create', action: 'groups', groupOp: 'create', groupName: 'Hiring', session: 'hiring' } as any);
+    expect(created).toMatchObject({ ok: true, data: { title: 'Hiring' } });
+    const id = (created.data as any).id;
+    expect(tabs.find(tab => tab.groupId === id)?.url).toBe('about:blank');
+    await mod.__test__.handleCommand({ id: 'g-close', action: 'close-window', session: 'hiring' });
+    expect(mod.__test__.getSession(browserKey('hiring'))).toBeNull();
+    expect(groups.find(group => group.id === id)?.title).toBe('Hiring');
+    expect(chrome.tabs.remove).not.toHaveBeenCalled();
+    expect(chrome.tabs.update).not.toHaveBeenCalled();
+  });
+
+  it('renames selected groups without resetting their title during worker recovery', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs[1].groupId = 91;
+    groups.push({ id: 91, windowId: 2, title: 'Hiring' });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.handleCommand({ id: 'g-use', action: 'groups', groupOp: 'use', groupId: 91, session: 'hiring' } as any);
+    const renamed = await mod.__test__.handleCommand({ id: 'g-rename', action: 'groups', groupOp: 'rename', groupId: 91, groupName: 'Recruiting', session: 'hiring' } as any);
+    expect(renamed).toMatchObject({ ok: true, data: { id: 91, title: 'Recruiting' } });
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    expect(mod.__test__.getSession(browserKey('hiring'))).toMatchObject({ kind: 'group', groupId: 91, owned: false });
+    expect(mod.__test__.getIdleTimeout(browserKey('hiring'))).toBe(-1);
+    expect(groups[0].title).toBe('Recruiting');
+    const listed = await mod.__test__.handleCommand({ id: 'g-list', action: 'tabs', op: 'list', session: 'hiring' });
+    expect(listed).toMatchObject({ ok: true, data: [{ page: 'target-2' }] });
+    expect(chrome.storage.local.set).not.toHaveBeenCalledWith(expect.objectContaining({ opencli_target_lease_registry_v2: expect.anything() }));
+  });
+
+  it('deletes a group by ungrouping member tabs and releases its bindings', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs[1].groupId = 91;
+    groups.push({ id: 91, windowId: 2, title: 'Hiring' });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.handleCommand({ id: 'g-use', action: 'groups', groupOp: 'use', groupId: 91, session: 'hiring' } as any);
+    const deleted = await mod.__test__.handleCommand({ id: 'g-delete', action: 'groups', groupOp: 'delete', groupId: 91, session: 'hiring' } as any);
+    expect(deleted).toMatchObject({ ok: true, data: { deleted: 91, tabsUngrouped: 1 } });
+    expect(tabs[1]).toMatchObject({ url: 'https://user.example', groupId: -1 });
+    expect(mod.__test__.getSession(browserKey('hiring'))).toBeNull();
+    expect(chrome.tabs.remove).not.toHaveBeenCalled();
+  });
+
+  it('fails closed for deleted groups and refuses targets outside the selected group', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs[1].groupId = 91;
+    groups.push({ id: 91, windowId: 2, title: 'Hiring' });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.handleCommand({ id: 'g-use', action: 'groups', groupOp: 'use', groupId: 91, session: 'hiring' } as any);
+    const outside = await mod.__test__.handleCommand({ id: 'g-outside', action: 'tabs', op: 'select', page: 'target-1', session: 'hiring' });
+    expect(outside).toMatchObject({ ok: false, errorCode: 'group_tab_mismatch' });
+    groups.length = 0;
+    const gone = await mod.__test__.handleCommand({ id: 'g-gone', action: 'tabs', op: 'new', session: 'hiring' });
+    expect(gone).toMatchObject({ ok: false, errorCode: 'tab_group_not_found' });
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+  });
+
+  it.each(['', '   '])('rejects empty create names %j before changing Chrome', async name => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const result = await mod.__test__.handleCommand({ id: 'g-empty', action: 'groups', groupOp: 'create', groupName: name, session: 'hiring' } as any);
+    expect(result).toMatchObject({ ok: false, errorCode: 'tab_group_name_required' });
+    expect(chrome.tabs.create).not.toHaveBeenCalled();
+  });
+
+  it('closes only a selected group member and retains the binding for remaining tabs', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs[1].groupId = 91;
+    tabs.push({ id: 88, windowId: 2, url: 'https://jobs.example', title: 'Jobs', status: 'complete', groupId: 91 });
+    groups.push({ id: 91, windowId: 2, title: 'Hiring' });
+    chrome.tabs.remove.mockImplementation(async id => { const index = tabs.findIndex(tab => tab.id === id); if (index >= 0) tabs.splice(index, 1); });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.handleCommand({ id: 'g-use', action: 'groups', groupOp: 'use', groupId: 91, session: 'hiring' } as any);
+    const closed = await mod.__test__.handleCommand({ id: 'g-close-tab', action: 'tabs', op: 'close', page: 'target-2', session: 'hiring' });
+    expect(closed).toMatchObject({ ok: true, data: { closed: 'target-2' } });
+    expect(tabs.some(tab => tab.id === 2)).toBe(false);
+    expect(tabs.some(tab => tab.id === 88)).toBe(true);
+    const listed = await mod.__test__.handleCommand({ id: 'g-list-tabs', action: 'tabs', op: 'list', session: 'hiring' });
+    expect(listed).toMatchObject({ ok: true, data: [{ page: 'target-88' }] });
+  });
+
+  it('preserves the selected default when inspecting another member explicitly', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs[1].groupId = 91;
+    tabs.push({ id: 88, windowId: 2, url: 'https://jobs.example', status: 'complete', groupId: 91 });
+    groups.push({ id: 91, windowId: 2, title: 'Hiring' });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.handleCommand({ id: 'g-use', action: 'groups', groupOp: 'use', groupId: 91, session: 'hiring' } as any);
+    expect(await mod.__test__.resolveTabId(88, browserKey('hiring'))).toBe(88);
+    expect(await mod.__test__.resolveTabId(undefined, browserKey('hiring'))).toBe(2);
+  });
+
+  it('leaves owned group tabs open and releases their leases when dissolving that group', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('owned'));
+    const groupId = (await chrome.tabs.get(tabId)).groupId!;
+    const result = await mod.__test__.handleCommand({ id: 'g-dissolve', action: 'groups', groupOp: 'delete', groupId, session: 'admin' } as any);
+    expect(result).toMatchObject({ ok: true, data: { deleted: groupId } });
+    expect(tabs.some(tab => tab.id === tabId)).toBe(true);
+    expect((await chrome.tabs.get(tabId)).groupId).toBe(-1);
+    expect(mod.__test__.getSession(browserKey('owned'))).toBeNull();
+    expect(groups.some(group => group.id === groupId)).toBe(false);
+  });
+
+  it('refuses to adopt a group owned by a different running session', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const tabId = await mod.__test__.resolveTabId(undefined, browserKey('owner'));
+    const groupId = (await chrome.tabs.get(tabId)).groupId!;
+    const result = await mod.__test__.handleCommand({ id: 'g-takeover', action: 'groups', groupOp: 'use', groupId, session: 'other' } as any);
+    expect(result).toMatchObject({ ok: false, errorCode: 'tab_group_busy' });
+    expect(mod.__test__.getSession(browserKey('owner'))?.owned).toBe(true);
+  });
+
+  it('does not persist Chrome runtime group IDs in local storage', async () => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const result = await mod.__test__.handleCommand({ id: 'g-create', action: 'groups', groupOp: 'create', groupName: 'Hiring', session: 'hiring' } as any);
+    expect(result.ok).toBe(true);
+    const raw = await chrome.storage.session.get('opencli_target_lease_registry_v2');
+    expect((raw.opencli_target_lease_registry_v2 as any).leases[browserKey('hiring')]).toMatchObject({ kind: 'group', groupId: (result.data as any).id });
+    expect(chrome.storage.local.set.mock.calls.some(call => JSON.stringify(call).includes('groupId'))).toBe(false);
+  });
+
+  it('propagates Chrome API failures instead of treating them as missing groups', async () => {
+    const { chrome } = createChromeMock();
+    chrome.tabGroups.get.mockRejectedValue(new Error('Extension context invalidated'));
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const result = await mod.__test__.handleCommand({ id: 'g-error', action: 'groups', groupOp: 'use', groupId: 91, session: 'hiring' } as any);
+    expect(result).toMatchObject({ ok: false, error: 'Extension context invalidated' });
+    expect(chrome.tabs.create).not.toHaveBeenCalled();
+  });
+
+  it.each([-1, NaN, 1.5])('rejects invalid group IDs %j', async groupId => {
+    const { chrome } = createChromeMock();
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const result = await mod.__test__.handleCommand({ id: 'g-id', action: 'groups', groupOp: 'use', groupId, session: 'hiring' } as any);
+    expect(result).toMatchObject({ ok: false, errorCode: 'tab_group_id_invalid' });
+    expect(chrome.tabs.create).not.toHaveBeenCalled();
+  });
+
+  it('keeps a binding usable when its preferred tab closes externally', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs[1].groupId = 91;
+    tabs.push({ id: 88, windowId: 2, url: 'https://jobs.example', status: 'complete', groupId: 91 });
+    groups.push({ id: 91, windowId: 2, title: 'Hiring' });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.handleCommand({ id: 'g-use', action: 'groups', groupOp: 'use', groupId: 91, session: 'hiring' } as any);
+    tabs.splice(tabs.findIndex(tab => tab.id === 2), 1);
+    await chrome.tabs.onRemoved.addListener.mock.calls[0][0](2);
+    expect(await mod.__test__.resolveTabId(undefined, browserKey('hiring'))).toBe(88);
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    expect(mod.__test__.getSession(browserKey('hiring'))).toMatchObject({ kind: 'group', groupId: 91 });
+  });
+
+  it('does not turn a deleted group into a default owned session after worker recovery', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs[1].groupId = 91;
+    groups.push({ id: 91, windowId: 2, title: 'Hiring' });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    await mod.__test__.handleCommand({ id: 'g-use', action: 'groups', groupOp: 'use', groupId: 91, session: 'hiring' } as any);
+    groups.length = 0;
+    await mod.__test__.reconcileTargetLeaseRegistry();
+    const result = await mod.__test__.handleCommand({ id: 'g-new', action: 'tabs', op: 'new', session: 'hiring' });
+    expect(result).toMatchObject({ ok: false, errorCode: 'tab_group_not_found' });
+    expect(chrome.windows.create).not.toHaveBeenCalled();
+  });
+
+  it('allows parallel group sessions on separate tabs but refuses a shared tab target', async () => {
+    const { chrome, tabs, groups } = createChromeMock();
+    tabs[1].groupId = 91;
+    tabs.push({ id: 88, windowId: 2, url: 'https://jobs.example', status: 'complete', groupId: 91 });
+    groups.push({ id: 91, windowId: 2, title: 'Hiring' });
+    vi.stubGlobal('chrome', chrome);
+    const mod = await import('./background');
+    const first = await mod.__test__.handleCommand({ id: 'g-first', action: 'groups', groupOp: 'use', groupId: 91, session: 'first' } as any);
+    const second = await mod.__test__.handleCommand({ id: 'g-second', action: 'groups', groupOp: 'use', groupId: 91, session: 'second' } as any);
+    expect(first).toMatchObject({ ok: true, page: 'target-2' });
+    expect(second).toMatchObject({ ok: true, page: 'target-88' });
+    const collision = await mod.__test__.handleCommand({ id: 'g-collision', action: 'tabs', op: 'select', page: 'target-2', session: 'second' });
+    expect(collision).toMatchObject({ ok: false, errorCode: 'group_tab_busy' });
+  });
+
   it('lists only automation-window web tabs', async () => {
     const { chrome } = createChromeMock();
     vi.stubGlobal('chrome', chrome);

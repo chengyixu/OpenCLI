@@ -30,6 +30,16 @@ Until `doctor` is green, nothing else will work. Typical failures: Chrome not ru
 - `opencli browser <session> bind` binds the Chrome tab you already have open to that session. Use this for logged-in pages, SSO flows, or pages you manually positioned before handing control to the agent.
 - `--window foreground|background` (or `OPENCLI_WINDOW=foreground|background`) chooses whether OpenCLI creates/focuses a foreground browser window or uses a background browser window for owned sessions.
 
+### Task tab groups
+
+Inspect `opencli browser <session> group list` before changing groups. For a task such as hiring, use `group create "Hiring"` or borrow an existing group with `group use "Hiring"`. The agent may choose a descriptive task name. Duplicate names require the listed numeric group ID; titles are matched exactly, not as patterns.
+
+After selection, `tab list`, `tab new`, `tab select`, `open` and page interactions stay inside that group. Use the same session name and profile for the task. Group sessions preserve user tabs when `close` releases control and have no idle page cleanup. For parallel work use separate tabs; `group_tab_busy` means another session controls that tab.
+
+`group rename <id> <name>` changes the group's name; `group delete <id>` ungroups its tabs and leaves them open. `tab close` explicitly closes a single tab. Verify group writes with `group list`. After Chrome or the extension restarts, rediscover IDs and run `group use` again. Live groups are available; closed/saved group entries are outside Chrome's extension API.
+
+See [browser task groups](../../docs/guide/browser-task-groups.md) for the command contract and recovery limits.
+
 ### Bind Tab
 
 ```bash
@@ -206,6 +216,11 @@ Default output keeps JSON/XML/plain-text and JS-like API responses, then drops o
 
 | command | purpose |
 |---------|---------|
+| `browser group list` | List live groups and member tabs across the selected profile. |
+| `browser group create <name> [--window-id <id>]` | Create and borrow a named task group using a new blank tab. |
+| `browser group use <name-or-id>` | Borrow an existing group for this session. |
+| `browser group rename <id> <name>` | Rename the chosen group. |
+| `browser group delete <id>` | Ungroup member tabs and detach bindings; pages remain open. |
 | `browser tab list` | JSON array of `{index, page, url, title, active}`. The `page` string is the tab identity you pass as `<targetId>` to `tab select` / `tab close`, or to `--tab <targetId>` on any subcommand. (`--tab`'s placeholder is historical — the value is always `page`.) |
 | `browser tab new [url]` | Open a new tab. Prints the new `page` string. |
 | `browser tab select [targetId]` | Make a tab the default. All subcommands accept `--tab <targetId>` to target one without changing the default. |

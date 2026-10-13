@@ -15,6 +15,7 @@ import { findPackageRoot, getBuiltEntryCandidates } from './package-paths.js';
 import { type CliCommand, fullName, getRegistry, strategyLabel } from './registry.js';
 import { serializeCommand, formatArgSummary } from './serialization.js';
 import { render as renderOutput } from './output.js';
+import type { GroupCommandFields } from './browser/group-contract.js';
 import { PKG_VERSION } from './version.js';
 import { printCompletionScript } from './completion.js';
 import { listOpenCliSkills, readOpenCliSkill } from './skills.js';
@@ -1019,6 +1020,63 @@ Examples:
       saveBrowserTargetState(undefined, getBrowserScope(session, contextId));
       console.log(JSON.stringify({ unbound: true, session }, null, 2));
     }));
+
+  const browserGroup = browser.command('group').description('Discover and manage live Chrome tab groups');
+
+  function groupIdArgument(raw: string): number {
+    const id = /^\d+$/.test(raw) ? Number(raw) : NaN;
+    if (!Number.isSafeInteger(id)) throw new BrowserCommandError('Use a non-negative group ID from group list.', 'tab_group_id_invalid');
+    return id;
+  }
+
+  function groupAction(groupOp: NonNullable<GroupCommandFields['groupOp']>) {
+    return async (...args: unknown[]) => {
+      try {
+        const command = args.at(-1) as Command;
+        const session = getBrowserSession(command);
+        const routing = profileRouteParams(getBrowserProfileSelection(command));
+        const values = args.filter((arg): arg is string => typeof arg === 'string');
+        const fields: GroupCommandFields = { groupOp };
+        if (groupOp === 'create') {
+          fields.groupName = values[0];
+          const windowId = command.opts().windowId;
+          if (windowId !== undefined) fields.groupWindowId = groupIdArgument(String(windowId));
+        } else if (groupOp === 'use' || groupOp === 'delete') {
+          if (/^\d+$/.test(values[0])) fields.groupId = groupIdArgument(values[0]);
+          else if (groupOp === 'use') fields.groupName = values[0];
+          else fields.groupId = groupIdArgument(values[0]);
+        } else if (groupOp === 'rename') {
+          fields.groupId = groupIdArgument(values[0]);
+          fields.groupName = values[1];
+        }
+        const { BrowserBridge } = await import('./browser/index.js');
+        await new BrowserBridge().connect({ timeout: DEFAULT_BROWSER_CONNECT_TIMEOUT, session, surface: 'browser', ...routing });
+        const windowMode = getBrowserWindowMode(command, 'foreground');
+        const data = await sendCommand('groups', { session, surface: 'browser', windowMode, ...routing, ...fields });
+        if (groupOp === 'create' || groupOp === 'use' || groupOp === 'delete') {
+          saveBrowserTargetState(undefined, getBrowserScope(session, routing.contextId ?? routing.preferredContextId));
+        }
+        console.log(JSON.stringify(data, null, 2));
+      } catch (err) {
+        if (err instanceof BrowserCommandError) {
+          emitBrowserCommandErrorEnvelope(err);
+          logBrowserCommandError(err);
+        } else log.error(getErrorMessage(err));
+        process.exitCode = EXIT_CODES.GENERIC_ERROR;
+      }
+    };
+  }
+
+  browserGroup.command('list').description('List every live group and its member tabs').action(groupAction('list'));
+  browserGroup.command('create').argument('<name>', 'Agent-chosen group name')
+    .option('--window-id <id>', 'Create the group in this Chrome window (default: current window)')
+    .description('Create a named group and use it for this session').action(groupAction('create'));
+  browserGroup.command('use').argument('<group>', 'Exact group name or numeric ID from group list')
+    .description('Borrow an existing group for this session').action(groupAction('use'));
+  browserGroup.command('rename').argument('<groupId>', 'Numeric group ID').argument('<name>', 'New group name')
+    .description('Rename a group without moving its tabs').action(groupAction('rename'));
+  browserGroup.command('delete').argument('<groupId>', 'Numeric group ID')
+    .description('Ungroup member tabs and leave them open').action(groupAction('delete'));
 
   const browserTab = browser
     .command('tab')
