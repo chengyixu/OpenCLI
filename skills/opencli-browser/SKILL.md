@@ -38,7 +38,7 @@ After selection, `tab list`, `tab new`, `tab select`, `open` and page interactio
 
 `group rename <id> <name>` changes the group's name; `group delete <id>` ungroups its tabs and leaves them open. `tab close` explicitly closes a single tab. Verify group writes with `group list`. After Chrome or the extension restarts, rediscover IDs and run `group use` again. Live groups are available; closed/saved group entries are outside Chrome's extension API.
 
-See [browser task groups](../../docs/guide/browser-task-groups.md) for the command contract and recovery limits.
+See [browser task groups](references/browser-task-groups.md) for the command contract and recovery limits.
 
 ### Bind Tab
 
